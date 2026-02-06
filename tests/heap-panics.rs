@@ -7,7 +7,7 @@ static ALLOC: dhat::Alloc = dhat::Alloc;
 #[test]
 fn main() {
     dhat::assert_is_panic(
-        || dhat::HeapStats::get(),
+        dhat::HeapStats::get,
         "dhat: getting heap stats when no profiler is running",
     );
 
@@ -20,12 +20,12 @@ fn main() {
         let _profiler = dhat::Profiler::new_heap();
 
         dhat::assert_is_panic(
-            || dhat::Profiler::new_heap(),
+            dhat::Profiler::new_heap,
             "dhat: creating a profiler while a profiler is already running",
         );
 
         dhat::assert_is_panic(
-            || dhat::AdHocStats::get(),
+            dhat::AdHocStats::get,
             "dhat: getting ad hoc stats while doing heap profiling",
         );
 
@@ -36,7 +36,7 @@ fn main() {
     }
 
     dhat::assert_is_panic(
-        || dhat::HeapStats::get(),
+        dhat::HeapStats::get,
         "dhat: getting heap stats when no profiler is running",
     );
 

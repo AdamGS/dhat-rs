@@ -1083,6 +1083,44 @@ impl ThreadBuffer {
     }
 }
 
+// Process a single pending allocation during buffer flush.
+// Assumes caller holds TRI_GLOBALS lock and g.heap is Some.
+fn process_pending_alloc(g: &mut Globals, pending: PendingAlloc) {
+    let dealloc_instant = {
+        let h = g.heap.as_mut().unwrap();
+        h.cancelled_pending.remove(&pending.ptr)
+    };
+
+    let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
+
+    g.total_blocks += 1;
+    g.total_bytes += pending.size as u64;
+
+    g.pp_infos[pp_info_idx].total_blocks += 1;
+    g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
+
+    if let Some(dealloc_instant) = dealloc_instant {
+        let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+        let lifetime = dealloc_instant.duration_since(pending.instant);
+        pp_heap.total_lifetimes_duration += lifetime;
+        return;
+    }
+
+    let h = g.heap.as_mut().unwrap();
+    if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
+        live_block.pp_info_idx = Some(pp_info_idx);
+
+        let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+        pp_heap.curr_blocks += 1;
+        pp_heap.curr_bytes += pending.size;
+
+        if pp_heap.curr_bytes >= pp_heap.max_bytes {
+            pp_heap.max_blocks = pp_heap.curr_blocks;
+            pp_heap.max_bytes = pp_heap.curr_bytes;
+        }
+    }
+}
+
 // Flush the thread buffer to global state. Called when buffer is full,
 // thread exits, or stats are requested.
 fn flush_thread_buffer() {
@@ -1101,47 +1139,7 @@ fn flush_thread_buffer() {
             let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
             if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
                 for pending in buffer.pending.drain(..) {
-                    // Check if this allocation was cancelled (deallocated while pending)
-                    let dealloc_instant = {
-                        let h = g.heap.as_mut().unwrap();
-                        h.cancelled_pending.remove(&pending.ptr)
-                    };
-
-                    // Resolve the backtrace (this borrows g)
-                    let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
-
-                    // Update total counts (always, even for cancelled allocations)
-                    g.total_blocks += 1;
-                    g.total_bytes += pending.size as u64;
-
-                    // Update PpInfo total counts
-                    g.pp_infos[pp_info_idx].total_blocks += 1;
-                    g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
-
-                    if let Some(dealloc_instant) = dealloc_instant {
-                        // Block was deallocated while pending. Update lifetime.
-                        let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
-                        let lifetime = dealloc_instant.duration_since(pending.instant);
-                        pp_heap.total_lifetimes_duration += lifetime;
-                        continue;
-                    }
-
-                    // Check if the block is still live (it should be if not cancelled)
-                    let h = g.heap.as_mut().unwrap();
-                    if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
-                        live_block.pp_info_idx = Some(pp_info_idx);
-
-                        // Update PpInfo curr counts
-                        let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
-                        pp_heap.curr_blocks += 1;
-                        pp_heap.curr_bytes += pending.size;
-
-                        // Check for PpInfo peak
-                        if pp_heap.curr_bytes >= pp_heap.max_bytes {
-                            pp_heap.max_blocks = pp_heap.curr_blocks;
-                            pp_heap.max_bytes = pp_heap.curr_bytes;
-                        }
-                    }
+                    process_pending_alloc(g, pending);
                 }
             }
         }
@@ -1178,45 +1176,7 @@ fn flush_all_thread_buffers() {
             let buffer = unsafe { &mut *buffer_ptr };
 
             for pending in buffer.pending.drain(..) {
-                // Check if this allocation was cancelled
-                let dealloc_instant = {
-                    let h = g.heap.as_mut().unwrap();
-                    h.cancelled_pending.remove(&pending.ptr)
-                };
-
-                // Resolve the backtrace
-                let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
-
-                // Update total counts
-                g.total_blocks += 1;
-                g.total_bytes += pending.size as u64;
-
-                // Update PpInfo total counts
-                g.pp_infos[pp_info_idx].total_blocks += 1;
-                g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
-
-                if let Some(dealloc_instant) = dealloc_instant {
-                    // Block was deallocated while pending.
-                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
-                    let lifetime = dealloc_instant.duration_since(pending.instant);
-                    pp_heap.total_lifetimes_duration += lifetime;
-                    continue;
-                }
-
-                // Update live block
-                let h = g.heap.as_mut().unwrap();
-                if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
-                    live_block.pp_info_idx = Some(pp_info_idx);
-
-                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
-                    pp_heap.curr_blocks += 1;
-                    pp_heap.curr_bytes += pending.size;
-
-                    if pp_heap.curr_bytes >= pp_heap.max_bytes {
-                        pp_heap.max_blocks = pp_heap.curr_blocks;
-                        pp_heap.max_bytes = pp_heap.curr_bytes;
-                    }
-                }
+                process_pending_alloc(g, pending);
             }
 
             // Mark buffer as no longer registered so Drop won't try to
@@ -1246,46 +1206,7 @@ impl Drop for ThreadBuffer {
 
             // Then flush any pending allocations.
             for pending in self.pending.drain(..) {
-                // Check if this allocation was cancelled
-                let dealloc_instant = {
-                    let h = g.heap.as_mut().unwrap();
-                    h.cancelled_pending.remove(&pending.ptr)
-                };
-
-                // Resolve the backtrace
-                let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
-
-                // Update total counts (always, even for cancelled allocations)
-                g.total_blocks += 1;
-                g.total_bytes += pending.size as u64;
-
-                // Update PpInfo total counts
-                g.pp_infos[pp_info_idx].total_blocks += 1;
-                g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
-
-                if let Some(dealloc_instant) = dealloc_instant {
-                    // Block was deallocated while pending. Update lifetime.
-                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
-                    let lifetime = dealloc_instant.duration_since(pending.instant);
-                    pp_heap.total_lifetimes_duration += lifetime;
-                    continue;
-                }
-
-                // Update live block
-                let h = g.heap.as_mut().unwrap();
-                if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
-                    live_block.pp_info_idx = Some(pp_info_idx);
-
-                    // Update PpInfo curr counts
-                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
-                    pp_heap.curr_blocks += 1;
-                    pp_heap.curr_bytes += pending.size;
-
-                    if pp_heap.curr_bytes >= pp_heap.max_bytes {
-                        pp_heap.max_blocks = pp_heap.curr_blocks;
-                        pp_heap.max_bytes = pp_heap.curr_bytes;
-                    }
-                }
+                process_pending_alloc(g, pending);
             }
         }
     }
@@ -1817,8 +1738,6 @@ unsafe impl GlobalAlloc for Alloc {
             System.dealloc(ptr, layout);
 
             if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
-
-
                 // Remove the record of the live block and get the
                 // `PpInfo`. If it's not in the live block table, it must
                 // have been allocated before `TRI_GLOBALS` was set up, and

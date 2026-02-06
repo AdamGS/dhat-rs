@@ -8,11 +8,6 @@
 //! - No profiling (baseline)
 //! - Unbuffered profiling (buffer_capacity = 0)
 //! - Buffered profiling (buffer_capacity = 64, the default)
-//!
-//! NOTE: The current buffering implementation provides thread-safety benefits
-//! (ensuring thread pool buffers are flushed on profiler drop) but does not yet
-//! move backtrace capture outside the lock, which limits performance gains.
-//! A future optimization could capture backtraces before acquiring the lock.
 
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;

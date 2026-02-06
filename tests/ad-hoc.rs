@@ -122,16 +122,8 @@ fn main() {
     assert!(matches!(pp3["fs"], Array(_)));
 
     let ftbl = &v["ftbl"].as_array().unwrap();
-    let y = |s| {
-        ftbl.iter()
-            .find(|&f| f.as_str().unwrap().contains(s))
-            .is_some()
-    };
-    let n = |s| {
-        ftbl.iter()
-            .find(|&f| f.as_str().unwrap().contains(s))
-            .is_none()
-    };
+    let y = |s| ftbl.iter().any(|f| f.as_str().unwrap().contains(s));
+    let n = |s| !ftbl.iter().any(|f| f.as_str().unwrap().contains(s));
     assert!(y("[root]"));
     assert!(y("dhat::ad_hoc_event"));
 
