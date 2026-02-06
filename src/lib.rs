@@ -592,7 +592,7 @@ impl Globals {
                 size,
             },
         );
-        std::assert!(matches!(old, None));
+        std::assert!(old.is_none());
     }
 
     fn update_counts_for_alloc(
@@ -1015,7 +1015,7 @@ struct IgnoreAllocs {
     was_already_ignoring_allocs: bool,
 }
 
-thread_local!(static IGNORE_ALLOCS: Cell<bool> = Cell::new(false));
+thread_local!(static IGNORE_ALLOCS: Cell<bool> = const { Cell::new(false) });
 
 impl IgnoreAllocs {
     fn new() -> Self {
@@ -2030,7 +2030,7 @@ impl PartialEq for Backtrace {
             if ip1 != ip2 {
                 return false;
             }
-            if ip1 == None {
+            if ip1.is_none() {
                 return true;
             }
             // Otherwise, continue.

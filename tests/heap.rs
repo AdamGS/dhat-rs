@@ -146,16 +146,8 @@ fn main() {
 
     // Look for parts of some expected frames.
     let ftbl = &v["ftbl"].as_array().unwrap();
-    let y = |s| {
-        ftbl.iter()
-            .find(|&f| f.as_str().unwrap().contains(s))
-            .is_some()
-    };
-    let n = |s| {
-        ftbl.iter()
-            .find(|&f| f.as_str().unwrap().contains(s))
-            .is_none()
-    };
+    let y = |s| ftbl.iter().any(|f| f.as_str().unwrap().contains(s));
+    let n = |s| !ftbl.iter().any(|f| f.as_str().unwrap().contains(s));
     assert!(y("[root]"));
 
     // These tests will fail if the repo directory isn't called `dhat-rs`.

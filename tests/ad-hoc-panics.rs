@@ -4,7 +4,7 @@
 #[test]
 fn main() {
     dhat::assert_is_panic(
-        || dhat::AdHocStats::get(),
+        dhat::AdHocStats::get,
         "dhat: getting ad hoc stats when no profiler is running",
     );
 
@@ -17,12 +17,12 @@ fn main() {
         let _profiler = dhat::Profiler::new_ad_hoc();
 
         dhat::assert_is_panic(
-            || dhat::Profiler::new_ad_hoc(),
+            dhat::Profiler::new_ad_hoc,
             "dhat: creating a profiler while a profiler is already running",
         );
 
         dhat::assert_is_panic(
-            || dhat::HeapStats::get(),
+            dhat::HeapStats::get,
             "dhat: getting heap stats while doing ad hoc profiling",
         );
 
@@ -33,7 +33,7 @@ fn main() {
     }
 
     dhat::assert_is_panic(
-        || dhat::AdHocStats::get(),
+        dhat::AdHocStats::get,
         "dhat: getting ad hoc stats when no profiler is running",
     );
 
