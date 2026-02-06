@@ -173,7 +173,7 @@ fn main() {
         }
     } else {
         assert!(y("alloc::vec::Vec<T,A>::push"));
-        assert!(y("heap::main (dhat-rs/tests/heap.rs:35:9)")); // v3
+        assert!(y("heap::main (dhat-rs/tests/heap.rs:35:12)")); // v3
         assert!(y("heap::main (dhat-rs/tests/heap.rs:38:18)")); // v5
         assert!(y("heap::main (dhat-rs/tests/heap.rs:39:22)")); // v6
         assert!(y("heap::main (dhat-rs/tests/heap.rs:49:22)")); // _v7
