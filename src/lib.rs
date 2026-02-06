@@ -385,6 +385,7 @@ use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
+use std::mem::ManuallyDrop;
 use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -892,14 +893,6 @@ impl HeapGlobals {
             false
         }
     }
-
-    // Unregister a thread buffer pointer (on thread exit).
-    fn unregister_thread_buffer(&mut self, ptr: *mut ThreadBuffer) {
-        let target = ThreadBufferPtr(ptr);
-        if let Some(pos) = self.thread_buffer_ptrs.iter().position(|&p| p == target) {
-            self.thread_buffer_ptrs.swap_remove(pos);
-        }
-    }
 }
 
 struct PpInfo {
@@ -1041,7 +1034,10 @@ const DEFAULT_BUFFER_CAPACITY: usize = 64;
 // Thread-local buffer for pending allocations whose backtraces haven't been
 // resolved yet.
 thread_local! {
-    static THREAD_BUFFER: RefCell<Option<ThreadBuffer>> = const { RefCell::new(None) };
+    // ManuallyDrop prevents TLS destructor from running, which is required because
+    // global allocators cannot use TLS with destructors. Cleanup happens via
+    // flush_all_thread_buffers() when the profiler is dropped.
+    static THREAD_BUFFER: RefCell<Option<ManuallyDrop<ThreadBuffer>>> = const { RefCell::new(None) };
 }
 
 // Thread-local cache for frame trimming info, to avoid locking on every allocation.
@@ -1186,31 +1182,9 @@ fn flush_all_thread_buffers() {
     }
 }
 
-impl Drop for ThreadBuffer {
-    fn drop(&mut self) {
-        // Flush any remaining pending allocations on thread exit.
-        // Note: We can't call flush_thread_buffer() here because we're
-        // already borrowing THREAD_BUFFER. Instead, inline the logic.
-        let ignore_allocs = IgnoreAllocs::new();
-        if ignore_allocs.was_already_ignoring_allocs {
-            return;
-        }
-
-        let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
-        if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
-            // Unregister this buffer from the global registry first.
-            if self.registered {
-                let self_ptr = self as *mut ThreadBuffer;
-                g.heap.as_mut().unwrap().unregister_thread_buffer(self_ptr);
-            }
-
-            // Then flush any pending allocations.
-            for pending in self.pending.drain(..) {
-                process_pending_alloc(g, pending);
-            }
-        }
-    }
-}
+// Note: ThreadBuffer intentionally has no Drop impl. We use ManuallyDrop in
+// THREAD_BUFFER because global allocators cannot use TLS with destructors.
+// Cleanup is handled by flush_all_thread_buffers() when the profiler drops.
 
 /// A type whose lifetime dictates the start and end of profiling.
 ///
@@ -1623,7 +1597,8 @@ unsafe impl GlobalAlloc for Alloc {
         if let Some((bt, buffer_capacity)) = buffered_alloc {
             let (should_flush, needs_registration) = THREAD_BUFFER.with(|tb| {
                 let mut tb_ref = tb.borrow_mut();
-                let buffer = tb_ref.get_or_insert_with(|| ThreadBuffer::new(buffer_capacity));
+                let buffer = tb_ref
+                    .get_or_insert_with(|| ManuallyDrop::new(ThreadBuffer::new(buffer_capacity)));
                 let needs_reg = !buffer.registered;
                 if needs_reg {
                     buffer.registered = true;
@@ -1645,10 +1620,10 @@ unsafe impl GlobalAlloc for Alloc {
                     let tb_ref = tb.borrow();
                     if let Some(buffer) = tb_ref.as_ref() {
                         // SAFETY: The pointer is to thread-local storage which
-                        // remains valid until the thread exits. We unregister
-                        // the pointer in ThreadBuffer's Drop before the storage
-                        // is invalidated.
-                        let buffer_ptr = buffer as *const ThreadBuffer as *mut ThreadBuffer;
+                        // remains valid until the thread exits. Since we use
+                        // ManuallyDrop, the buffer is never dropped automatically.
+                        // Cleanup happens via flush_all_thread_buffers().
+                        let buffer_ptr = &**buffer as *const ThreadBuffer as *mut ThreadBuffer;
                         let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
                         if let Phase::Running(Globals { heap: Some(h), .. }) = phase {
                             h.register_thread_buffer(buffer_ptr);
