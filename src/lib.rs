@@ -381,7 +381,7 @@ use mintex::Mutex;
 use rustc_hash::FxHashMap;
 use serde::Serialize;
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
@@ -444,6 +444,9 @@ struct Globals {
     // Print the JSON to stderr when saving it?
     eprint_json: bool,
 
+    // Capacity for thread-local allocation buffers. 0 disables buffering.
+    buffer_capacity: usize,
+
     // The backtrace at startup. Used for backtrace trimmming.
     start_bt: Backtrace,
 
@@ -491,6 +494,10 @@ struct HeapGlobals {
     // implement `Send`.
     live_blocks: FxHashMap<usize, LiveBlock>,
 
+    // Pointers that were deallocated while their backtrace was still pending
+    // in a thread-local buffer. Maps ptr -> deallocation instant for lifetime tracking.
+    cancelled_pending: FxHashMap<usize, Instant>,
+
     // Current counts.
     curr_blocks: usize,
     curr_bytes: usize,
@@ -509,6 +516,7 @@ impl Globals {
         file_name: PathBuf,
         trim_backtraces: Option<usize>,
         eprint_json: bool,
+        buffer_capacity: usize,
         heap: Option<HeapGlobals>,
     ) -> Self {
         Self {
@@ -516,6 +524,7 @@ impl Globals {
             file_name,
             trim_backtraces,
             eprint_json,
+            buffer_capacity,
             // `None` here because we don't want any frame trimming for this
             // backtrace.
             start_bt: new_backtrace_inner(None, &FxHashMap::default()),
@@ -539,13 +548,20 @@ impl Globals {
         })
     }
 
-    fn record_block(&mut self, ptr: *mut u8, pp_info_idx: usize, now: Instant) {
+    fn record_block(
+        &mut self,
+        ptr: *mut u8,
+        pp_info_idx: Option<usize>,
+        size: usize,
+        now: Instant,
+    ) {
         let h = self.heap.as_mut().unwrap();
         let old = h.live_blocks.insert(
             ptr as usize,
             LiveBlock {
                 pp_info_idx,
                 allocation_instant: now,
+                size,
             },
         );
         std::assert!(matches!(old, None));
@@ -661,13 +677,17 @@ impl Globals {
             for &LiveBlock {
                 pp_info_idx,
                 allocation_instant,
+                size: _,
             } in h.live_blocks.values()
             {
-                self.pp_infos[pp_info_idx]
-                    .heap
-                    .as_mut()
-                    .unwrap()
-                    .total_lifetimes_duration += now.duration_since(allocation_instant);
+                // Only update if the block has been resolved (not pending).
+                if let Some(idx) = pp_info_idx {
+                    self.pp_infos[idx]
+                        .heap
+                        .as_mut()
+                        .unwrap()
+                        .total_lifetimes_duration += now.duration_since(allocation_instant);
+                }
             }
         }
 
@@ -821,6 +841,7 @@ impl HeapGlobals {
     fn new() -> Self {
         Self {
             live_blocks: FxHashMap::default(),
+            cancelled_pending: FxHashMap::default(),
             curr_blocks: 0,
             curr_bytes: 0,
             max_blocks: 0,
@@ -914,11 +935,15 @@ impl PpInfo {
 }
 
 struct LiveBlock {
-    // The index of the PpInfo for this block.
-    pp_info_idx: usize,
+    // The index of the PpInfo for this block. None if the backtrace hasn't
+    // been resolved yet (pending in thread-local buffer).
+    pp_info_idx: Option<usize>,
 
     // When the block was allocated.
     allocation_instant: Instant,
+
+    // The size of the allocation.
+    size: usize,
 }
 
 // We record info about allocations and deallocations. A wrinkle: the recording
@@ -955,6 +980,169 @@ impl Drop for IgnoreAllocs {
     fn drop(&mut self) {
         if !self.was_already_ignoring_allocs {
             IGNORE_ALLOCS.with(|b| b.set(false));
+        }
+    }
+}
+
+// Default buffer capacity for thread-local pending allocations.
+const DEFAULT_BUFFER_CAPACITY: usize = 64;
+
+// Thread-local buffer for pending allocations whose backtraces haven't been
+// resolved yet.
+thread_local! {
+    static THREAD_BUFFER: RefCell<Option<ThreadBuffer>> = const { RefCell::new(None) };
+}
+
+// A pending allocation whose backtrace hasn't been resolved yet.
+struct PendingAlloc {
+    ptr: usize,
+    backtrace: Backtrace,
+    size: usize,
+    instant: Instant,
+}
+
+// Per-thread buffer for pending allocations.
+struct ThreadBuffer {
+    pending: Vec<PendingAlloc>,
+    capacity: usize,
+}
+
+impl ThreadBuffer {
+    fn new(capacity: usize) -> Self {
+        Self {
+            pending: Vec::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn is_full(&self) -> bool {
+        self.pending.len() >= self.capacity
+    }
+}
+
+// Flush the thread buffer to global state. Called when buffer is full,
+// thread exits, or stats are requested.
+fn flush_thread_buffer() {
+    let ignore_allocs = IgnoreAllocs::new();
+    if ignore_allocs.was_already_ignoring_allocs {
+        return;
+    }
+
+    THREAD_BUFFER.with(|tb| {
+        let mut tb_ref = tb.borrow_mut();
+        if let Some(buffer) = tb_ref.as_mut() {
+            if buffer.pending.is_empty() {
+                return;
+            }
+
+            let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
+            if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
+                for pending in buffer.pending.drain(..) {
+                    // Check if this allocation was cancelled (deallocated while pending)
+                    let dealloc_instant = {
+                        let h = g.heap.as_mut().unwrap();
+                        h.cancelled_pending.remove(&pending.ptr)
+                    };
+
+                    // Resolve the backtrace (this borrows g)
+                    let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
+
+                    // Update total counts (always, even for cancelled allocations)
+                    g.total_blocks += 1;
+                    g.total_bytes += pending.size as u64;
+
+                    // Update PpInfo total counts
+                    g.pp_infos[pp_info_idx].total_blocks += 1;
+                    g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
+
+                    if let Some(dealloc_instant) = dealloc_instant {
+                        // Block was deallocated while pending. Update lifetime.
+                        let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+                        let lifetime = dealloc_instant.duration_since(pending.instant);
+                        pp_heap.total_lifetimes_duration += lifetime;
+                        continue;
+                    }
+
+                    // Check if the block is still live (it should be if not cancelled)
+                    let h = g.heap.as_mut().unwrap();
+                    if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
+                        live_block.pp_info_idx = Some(pp_info_idx);
+
+                        // Update PpInfo curr counts
+                        let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+                        pp_heap.curr_blocks += 1;
+                        pp_heap.curr_bytes += pending.size;
+
+                        // Check for PpInfo peak
+                        if pp_heap.curr_bytes >= pp_heap.max_bytes {
+                            pp_heap.max_blocks = pp_heap.curr_blocks;
+                            pp_heap.max_bytes = pp_heap.curr_bytes;
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
+
+impl Drop for ThreadBuffer {
+    fn drop(&mut self) {
+        // Flush any remaining pending allocations on thread exit.
+        // Note: We can't call flush_thread_buffer() here because we're
+        // already borrowing THREAD_BUFFER. Instead, inline the logic.
+        let ignore_allocs = IgnoreAllocs::new();
+        if ignore_allocs.was_already_ignoring_allocs {
+            return;
+        }
+
+        if self.pending.is_empty() {
+            return;
+        }
+
+        let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
+        if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
+            for pending in self.pending.drain(..) {
+                // Check if this allocation was cancelled
+                let dealloc_instant = {
+                    let h = g.heap.as_mut().unwrap();
+                    h.cancelled_pending.remove(&pending.ptr)
+                };
+
+                // Resolve the backtrace
+                let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
+
+                // Update total counts (always, even for cancelled allocations)
+                g.total_blocks += 1;
+                g.total_bytes += pending.size as u64;
+
+                // Update PpInfo total counts
+                g.pp_infos[pp_info_idx].total_blocks += 1;
+                g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
+
+                if let Some(dealloc_instant) = dealloc_instant {
+                    // Block was deallocated while pending. Update lifetime.
+                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+                    let lifetime = dealloc_instant.duration_since(pending.instant);
+                    pp_heap.total_lifetimes_duration += lifetime;
+                    continue;
+                }
+
+                // Update live block
+                let h = g.heap.as_mut().unwrap();
+                if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
+                    live_block.pp_info_idx = Some(pp_info_idx);
+
+                    // Update PpInfo curr counts
+                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+                    pp_heap.curr_blocks += 1;
+                    pp_heap.curr_bytes += pending.size;
+
+                    if pp_heap.curr_bytes >= pp_heap.max_bytes {
+                        pp_heap.max_blocks = pp_heap.curr_blocks;
+                        pp_heap.max_bytes = pp_heap.curr_bytes;
+                    }
+                }
+            }
         }
     }
 }
@@ -1016,6 +1204,7 @@ impl Profiler {
             file_name: None,
             trim_backtraces: Some(10),
             eprint_json: false,
+            buffer_capacity: DEFAULT_BUFFER_CAPACITY,
         }
     }
 }
@@ -1031,6 +1220,7 @@ pub struct ProfilerBuilder {
     file_name: Option<PathBuf>,
     trim_backtraces: Option<usize>,
     eprint_json: bool,
+    buffer_capacity: usize,
 }
 
 impl ProfilerBuilder {
@@ -1108,6 +1298,39 @@ impl ProfilerBuilder {
         self
     }
 
+    /// Sets the capacity for per-thread allocation buffers.
+    ///
+    /// When heap profiling, allocation tracking can be buffered per-thread to
+    /// reduce contention on the global mutex in multi-threaded programs.
+    /// This is especially beneficial when many threads are allocating
+    /// simultaneously.
+    ///
+    /// - `0`: Disables buffering, using the original unbuffered behavior.
+    /// - `n > 0`: Buffers up to `n` allocations per thread before flushing
+    ///   to global state.
+    ///
+    /// The default value is 64. Higher values reduce mutex contention but
+    /// increase per-thread memory usage (approximately 200 bytes per buffered
+    /// allocation).
+    ///
+    /// This setting has no effect for ad hoc profiling.
+    ///
+    /// # Examples
+    /// ```
+    /// // Disable buffering for single-threaded programs
+    /// let _profiler = dhat::Profiler::builder().buffer_capacity(0).build();
+    /// # std::mem::forget(_profiler); // Don't write the file in `cargo tests`
+    /// ```
+    /// ```
+    /// // Increase buffer for highly multi-threaded programs
+    /// let _profiler = dhat::Profiler::builder().buffer_capacity(128).build();
+    /// # std::mem::forget(_profiler); // Don't write the file in `cargo tests`
+    /// ```
+    pub fn buffer_capacity(mut self, capacity: usize) -> Self {
+        self.buffer_capacity = capacity;
+        self
+    }
+
     // For testing purposes only. Useful for seeing what went wrong if a test
     // fails on CI.
     #[doc(hidden)]
@@ -1145,6 +1368,7 @@ impl ProfilerBuilder {
                     file_name,
                     self.trim_backtraces,
                     self.eprint_json,
+                    self.buffer_capacity,
                     h,
                 ));
             }
@@ -1226,25 +1450,77 @@ unsafe impl GlobalAlloc for Alloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ignore_allocs = IgnoreAllocs::new();
         if ignore_allocs.was_already_ignoring_allocs {
-            System.alloc(layout)
-        } else {
-            let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
-            let ptr = System.alloc(layout);
-            if ptr.is_null() {
-                return ptr;
-            }
-
-            if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
-                let size = layout.size();
-                let bt = new_backtrace!(g);
-                let pp_info_idx = g.get_pp_info(bt, PpInfo::new_heap);
-
-                let now = Instant::now();
-                g.record_block(ptr, pp_info_idx, now);
-                g.update_counts_for_alloc(pp_info_idx, size, None, now);
-            }
-            ptr
+            return System.alloc(layout);
         }
+
+        let ptr = System.alloc(layout);
+        if ptr.is_null() {
+            return ptr;
+        }
+
+        let size = layout.size();
+        let now = Instant::now();
+
+        // Scope the lock to minimize hold time
+        let buffered_alloc = {
+            let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
+            if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
+                let buffer_capacity = g.buffer_capacity;
+
+                if buffer_capacity > 0 {
+                    // Buffered path: capture backtrace, insert pending block
+                    let bt = new_backtrace!(g);
+
+                    // Insert pending block with pp_info_idx=None
+                    g.record_block(ptr, None, size, now);
+
+                    // Update curr_blocks/curr_bytes for peak tracking
+                    // (total_blocks/total_bytes and PpInfo are updated during flush)
+                    let h = g.heap.as_mut().unwrap();
+                    h.curr_blocks += 1;
+                    h.curr_bytes += size;
+
+                    // Check for peak
+                    if h.curr_bytes >= h.max_bytes {
+                        h.max_bytes = h.curr_bytes;
+                        h.max_blocks = h.curr_blocks;
+                        h.tgmax_instant = now;
+                    }
+
+                    Some((bt, buffer_capacity))
+                } else {
+                    // Unbuffered path: original behavior
+                    let bt = new_backtrace!(g);
+                    let pp_info_idx = g.get_pp_info(bt, PpInfo::new_heap);
+                    g.record_block(ptr, Some(pp_info_idx), size, now);
+                    g.update_counts_for_alloc(pp_info_idx, size, None, now);
+                    None
+                }
+            } else {
+                None
+            }
+        }; // Lock released here
+
+        // Add to thread buffer if we're using buffering
+        if let Some((bt, buffer_capacity)) = buffered_alloc {
+            let should_flush = THREAD_BUFFER.with(|tb| {
+                let mut tb_ref = tb.borrow_mut();
+                let buffer = tb_ref.get_or_insert_with(|| ThreadBuffer::new(buffer_capacity));
+                buffer.pending.push(PendingAlloc {
+                    ptr: ptr as usize,
+                    backtrace: bt,
+                    size,
+                    instant: now,
+                });
+                buffer.is_full()
+            });
+
+            if should_flush {
+                flush_thread_buffer();
+            }
+        }
+
+        ptr
     }
 
     unsafe fn realloc(&self, old_ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
@@ -1270,19 +1546,41 @@ unsafe impl GlobalAlloc for Alloc {
                 // Remove the record of the existing live block and get the
                 // `PpInfo`. If it's not in the live block table, it must
                 // have been allocated before `TRI_GLOBALS` was set up, and
-                // we treat it like an `alloc`.
+                // we treat it like an `alloc`. If pp_info_idx is None, the
+                // block was pending (backtrace not yet resolved), so we also
+                // treat it as a new allocation.
+                let now = Instant::now();
                 let h = g.heap.as_mut().unwrap();
                 let live_block = h.live_blocks.remove(&(old_ptr as usize));
-                let (pp_info_idx, delta) = if let Some(live_block) = live_block {
-                    (live_block.pp_info_idx, Some(delta))
-                } else {
-                    let bt = new_backtrace!(g);
-                    let pp_info_idx = g.get_pp_info(bt, PpInfo::new_heap);
-                    (pp_info_idx, None)
+                let (pp_info_idx, delta) = match live_block {
+                    Some(LiveBlock {
+                        pp_info_idx: Some(idx),
+                        ..
+                    }) => (idx, Some(delta)),
+                    Some(LiveBlock {
+                        pp_info_idx: None,
+                        size: old_block_size,
+                        ..
+                    }) => {
+                        // Pending block being reallocated. Mark as cancelled
+                        // so the buffer flush updates lifetime.
+                        h.cancelled_pending.insert(old_ptr as usize, now);
+                        // Decrement curr counts that were incremented in the
+                        // buffered alloc() - update_counts_for_alloc will add
+                        // them back for the new allocation.
+                        h.curr_blocks -= 1;
+                        h.curr_bytes -= old_block_size;
+                        let bt = new_backtrace!(g);
+                        let pp_info_idx = g.get_pp_info(bt, PpInfo::new_heap);
+                        (pp_info_idx, None)
+                    }
+                    None => {
+                        let bt = new_backtrace!(g);
+                        let pp_info_idx = g.get_pp_info(bt, PpInfo::new_heap);
+                        (pp_info_idx, None)
+                    }
                 };
-
-                let now = Instant::now();
-                g.record_block(new_ptr, pp_info_idx, now);
+                g.record_block(new_ptr, Some(pp_info_idx), new_size, now);
                 g.update_counts_for_alloc(pp_info_idx, new_size, delta, now);
             }
             new_ptr
@@ -1308,13 +1606,29 @@ unsafe impl GlobalAlloc for Alloc {
                 if let Some(LiveBlock {
                     pp_info_idx,
                     allocation_instant,
+                    size: live_block_size,
                 }) = h.live_blocks.remove(&(ptr as usize))
                 {
                     // Total bytes is coming down from a possible peak.
                     g.check_for_global_peak();
 
-                    let alloc_duration = allocation_instant.elapsed();
-                    g.update_counts_for_dealloc(pp_info_idx, size, alloc_duration);
+                    match pp_info_idx {
+                        Some(idx) => {
+                            // Normal case: block has resolved backtrace.
+                            let alloc_duration = allocation_instant.elapsed();
+                            g.update_counts_for_dealloc(idx, live_block_size, alloc_duration);
+                        }
+                        None => {
+                            // Pending block being deallocated before its
+                            // backtrace was resolved. Mark as cancelled so
+                            // the buffer flush updates lifetime. Still need
+                            // to update global counts.
+                            let h = g.heap.as_mut().unwrap();
+                            h.cancelled_pending.insert(ptr as usize, Instant::now());
+                            h.curr_blocks -= 1;
+                            h.curr_bytes -= live_block_size;
+                        }
+                    }
                 }
             }
         }
@@ -1342,6 +1656,9 @@ pub fn ad_hoc_event(weight: usize) {
 
 impl Profiler {
     fn drop_inner(&mut self, memory_output: Option<&mut String>) {
+        // Flush any pending allocations from this thread's buffer first.
+        flush_thread_buffer();
+
         let ignore_allocs = IgnoreAllocs::new();
         std::assert!(!ignore_allocs.was_already_ignoring_allocs);
 
@@ -1644,6 +1961,10 @@ impl HeapStats {
     /// Panics if called when a [`Profiler`] is not running or not doing heap
     /// profiling.
     pub fn get() -> Self {
+        // Flush pending allocations from this thread's buffer first
+        // to ensure accurate stats.
+        flush_thread_buffer();
+
         let ignore_allocs = IgnoreAllocs::new();
         std::assert!(!ignore_allocs.was_already_ignoring_allocs);
 
