@@ -387,10 +387,15 @@ use std::hash::{Hash, Hasher};
 use std::io::BufWriter;
 use std::ops::AddAssign;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 use thousands::Separable;
 
 static TRI_GLOBALS: Mutex<Phase<Globals>> = Mutex::new(Phase::Ready);
+
+// Generation counter for invalidating thread-local caches when profiler restarts.
+// Incremented each time a new profiler is created.
+static PROFILER_GENERATION: AtomicU64 = AtomicU64::new(0);
 
 // State transition diagram:
 //
@@ -484,6 +489,22 @@ struct Globals {
     heap: Option<HeapGlobals>,
 }
 
+// Maximum number of threads whose buffers we track. Pre-allocated to avoid
+// allocations during profiling.
+const MAX_TRACKED_THREADS: usize = 128;
+
+// A wrapper for raw pointers that implements Send. This is safe because we
+// only access the pointed-to ThreadBuffer while holding TRI_GLOBALS lock,
+// and we ensure the pointer is valid.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ThreadBufferPtr(*mut ThreadBuffer);
+
+// SAFETY: ThreadBufferPtr is only dereferenced while holding the TRI_GLOBALS
+// mutex, which provides synchronization. The pointer points to thread-local
+// storage that remains valid until the thread exits, and we unregister the
+// pointer in ThreadBuffer's Drop before the storage is invalidated.
+unsafe impl Send for ThreadBufferPtr {}
+
 struct HeapGlobals {
     // Each live block is associated with a `PpInfo`. An element is deleted
     // when the corresponding allocation is freed.
@@ -497,6 +518,13 @@ struct HeapGlobals {
     // Pointers that were deallocated while their backtrace was still pending
     // in a thread-local buffer. Maps ptr -> deallocation instant for lifetime tracking.
     cancelled_pending: FxHashMap<usize, Instant>,
+
+    // Pointers to thread-local buffers, for flushing on profiler drop.
+    // Pre-allocated to MAX_TRACKED_THREADS to avoid allocations during profiling.
+    // Each pointer is to a ThreadBuffer in thread-local storage. We use raw
+    // pointers because Arc/Weak allocate, which would cause deadlocks in the
+    // allocator.
+    thread_buffer_ptrs: Vec<ThreadBufferPtr>,
 
     // Current counts.
     curr_blocks: usize,
@@ -839,14 +867,37 @@ impl Globals {
 
 impl HeapGlobals {
     fn new() -> Self {
+        let mut thread_buffer_ptrs = Vec::new();
+        // Pre-allocate to avoid allocations during profiling.
+        thread_buffer_ptrs.reserve_exact(MAX_TRACKED_THREADS);
         Self {
             live_blocks: FxHashMap::default(),
             cancelled_pending: FxHashMap::default(),
+            thread_buffer_ptrs,
             curr_blocks: 0,
             curr_bytes: 0,
             max_blocks: 0,
             max_bytes: 0,
             tgmax_instant: Instant::now(),
+        }
+    }
+
+    // Register a thread buffer pointer. Returns true if successful, false if
+    // the registry is full.
+    fn register_thread_buffer(&mut self, ptr: *mut ThreadBuffer) -> bool {
+        if self.thread_buffer_ptrs.len() < MAX_TRACKED_THREADS {
+            self.thread_buffer_ptrs.push(ThreadBufferPtr(ptr));
+            true
+        } else {
+            false
+        }
+    }
+
+    // Unregister a thread buffer pointer (on thread exit).
+    fn unregister_thread_buffer(&mut self, ptr: *mut ThreadBuffer) {
+        let target = ThreadBufferPtr(ptr);
+        if let Some(pos) = self.thread_buffer_ptrs.iter().position(|&p| p == target) {
+            self.thread_buffer_ptrs.swap_remove(pos);
         }
     }
 }
@@ -993,6 +1044,14 @@ thread_local! {
     static THREAD_BUFFER: RefCell<Option<ThreadBuffer>> = const { RefCell::new(None) };
 }
 
+// Thread-local cache for frame trimming info, to avoid locking on every allocation.
+// Includes generation to detect stale caches when profiler is restarted.
+// Format: (generation, trim_backtraces, frames_ptr)
+thread_local! {
+    static FRAME_TRIM_CACHE: Cell<Option<(u64, Option<usize>, *const FxHashMap<usize, TB>)>> =
+        const { Cell::new(None) };
+}
+
 // A pending allocation whose backtrace hasn't been resolved yet.
 struct PendingAlloc {
     ptr: usize,
@@ -1005,6 +1064,9 @@ struct PendingAlloc {
 struct ThreadBuffer {
     pending: Vec<PendingAlloc>,
     capacity: usize,
+    // Whether this buffer has been registered with the global registry.
+    // Registration happens lazily on first use to avoid locking issues.
+    registered: bool,
 }
 
 impl ThreadBuffer {
@@ -1012,6 +1074,7 @@ impl ThreadBuffer {
         Self {
             pending: Vec::with_capacity(capacity),
             capacity,
+            registered: false,
         }
     }
 
@@ -1085,6 +1148,84 @@ fn flush_thread_buffer() {
     });
 }
 
+// Flush all registered thread buffers. Called when profiler is dropped to
+// ensure all pending allocations from all threads are processed, including
+// threads that haven't exited yet (like thread pools).
+fn flush_all_thread_buffers() {
+    let ignore_allocs = IgnoreAllocs::new();
+    if ignore_allocs.was_already_ignoring_allocs {
+        return;
+    }
+
+    let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
+    if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
+        // Take all registered buffer pointers. We don't need to put them back
+        // since the profiler is being dropped.
+        let buffer_ptrs: Vec<ThreadBufferPtr> = g
+            .heap
+            .as_mut()
+            .unwrap()
+            .thread_buffer_ptrs
+            .drain(..)
+            .collect();
+
+        for ThreadBufferPtr(buffer_ptr) in buffer_ptrs {
+            // SAFETY: The pointer was registered by a thread that is still
+            // alive (otherwise it would have been unregistered in Drop).
+            // We hold the TRI_GLOBALS lock, so no other thread can be
+            // modifying the buffer. The pointer points to valid ThreadBuffer
+            // storage in the thread's TLS.
+            let buffer = unsafe { &mut *buffer_ptr };
+
+            for pending in buffer.pending.drain(..) {
+                // Check if this allocation was cancelled
+                let dealloc_instant = {
+                    let h = g.heap.as_mut().unwrap();
+                    h.cancelled_pending.remove(&pending.ptr)
+                };
+
+                // Resolve the backtrace
+                let pp_info_idx = g.get_pp_info(pending.backtrace, PpInfo::new_heap);
+
+                // Update total counts
+                g.total_blocks += 1;
+                g.total_bytes += pending.size as u64;
+
+                // Update PpInfo total counts
+                g.pp_infos[pp_info_idx].total_blocks += 1;
+                g.pp_infos[pp_info_idx].total_bytes += pending.size as u64;
+
+                if let Some(dealloc_instant) = dealloc_instant {
+                    // Block was deallocated while pending.
+                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+                    let lifetime = dealloc_instant.duration_since(pending.instant);
+                    pp_heap.total_lifetimes_duration += lifetime;
+                    continue;
+                }
+
+                // Update live block
+                let h = g.heap.as_mut().unwrap();
+                if let Some(live_block) = h.live_blocks.get_mut(&pending.ptr) {
+                    live_block.pp_info_idx = Some(pp_info_idx);
+
+                    let pp_heap = g.pp_infos[pp_info_idx].heap.as_mut().unwrap();
+                    pp_heap.curr_blocks += 1;
+                    pp_heap.curr_bytes += pending.size;
+
+                    if pp_heap.curr_bytes >= pp_heap.max_bytes {
+                        pp_heap.max_blocks = pp_heap.curr_blocks;
+                        pp_heap.max_bytes = pp_heap.curr_bytes;
+                    }
+                }
+            }
+
+            // Mark buffer as no longer registered so Drop won't try to
+            // unregister it again.
+            buffer.registered = false;
+        }
+    }
+}
+
 impl Drop for ThreadBuffer {
     fn drop(&mut self) {
         // Flush any remaining pending allocations on thread exit.
@@ -1095,12 +1236,15 @@ impl Drop for ThreadBuffer {
             return;
         }
 
-        if self.pending.is_empty() {
-            return;
-        }
-
         let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
         if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
+            // Unregister this buffer from the global registry first.
+            if self.registered {
+                let self_ptr = self as *mut ThreadBuffer;
+                g.heap.as_mut().unwrap().unregister_thread_buffer(self_ptr);
+            }
+
+            // Then flush any pending allocations.
             for pending in self.pending.drain(..) {
                 // Check if this allocation was cancelled
                 let dealloc_instant = {
@@ -1371,6 +1515,8 @@ impl ProfilerBuilder {
                     self.buffer_capacity,
                     h,
                 ));
+                // Increment generation to invalidate any stale thread-local caches
+                PROFILER_GENERATION.fetch_add(1, Ordering::Relaxed);
             }
             Phase::Running(_) | Phase::PostAssert => {
                 panic!("dhat: creating a profiler while a profiler is already running")
@@ -1461,26 +1607,77 @@ unsafe impl GlobalAlloc for Alloc {
         let size = layout.size();
         let now = Instant::now();
 
-        // Scope the lock to minimize hold time
-        let buffered_alloc = {
+        // Check thread-local cache for frame trimming info (for buffered path).
+        // This avoids locking twice per allocation after the first one.
+        let current_gen = PROFILER_GENERATION.load(Ordering::Relaxed);
+        let cached_trim_info = FRAME_TRIM_CACHE.with(|c| c.get());
+
+        // Only use cache if generation matches (profiler hasn't been restarted)
+        let valid_cache = cached_trim_info.filter(|(gen, _, _)| *gen == current_gen);
+
+        let buffered_alloc = if let Some((_, trim_backtraces, frames_ptr)) = valid_cache {
+            // Fast path: we have valid cached frame trimming info.
+            // Capture backtrace OUTSIDE the lock using cached info.
+            // SAFETY: frames_ptr points to valid data in Globals that won't be
+            // modified or deallocated while the profiler is running (generation
+            // check ensures the profiler hasn't been restarted).
+            let frames_to_trim = unsafe { &*frames_ptr };
+            let bt = new_backtrace_inner(trim_backtraces, frames_to_trim);
+
+            // Now lock once to record the pending block.
+            let buffer_capacity = {
+                let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
+                if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
+                    g.record_block(ptr, None, size, now);
+
+                    let h = g.heap.as_mut().unwrap();
+                    h.curr_blocks += 1;
+                    h.curr_bytes += size;
+
+                    if h.curr_bytes >= h.max_bytes {
+                        h.max_bytes = h.curr_bytes;
+                        h.max_blocks = h.curr_blocks;
+                        h.tgmax_instant = now;
+                    }
+
+                    Some(g.buffer_capacity)
+                } else {
+                    // Profiler was dropped, clear cache
+                    FRAME_TRIM_CACHE.with(|c| c.set(None));
+                    None
+                }
+            };
+
+            buffer_capacity.map(|cap| (bt, cap))
+        } else {
+            // Slow path: first allocation on this thread, or unbuffered mode.
+            // Need to lock to check mode and possibly initialize frame trimming.
             let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
             if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
                 let buffer_capacity = g.buffer_capacity;
 
                 if buffer_capacity > 0 {
-                    // Buffered path: capture backtrace, insert pending block
+                    // Buffered path: initialize frame trimming if needed
+                    if g.frames_to_trim.is_none() {
+                        let bt = new_backtrace_inner(None, &FxHashMap::default());
+                        g.frames_to_trim = Some(bt.get_frames_to_trim(&g.start_bt));
+                    }
+
+                    // Cache the frame trimming info for future allocations
+                    let frames_ptr = g.frames_to_trim.as_ref().unwrap() as *const _;
+                    FRAME_TRIM_CACHE
+                        .with(|c| c.set(Some((current_gen, g.trim_backtraces, frames_ptr))));
+
+                    // Capture backtrace (still inside lock for first allocation)
                     let bt = new_backtrace!(g);
 
-                    // Insert pending block with pp_info_idx=None
+                    // Record pending block
                     g.record_block(ptr, None, size, now);
 
-                    // Update curr_blocks/curr_bytes for peak tracking
-                    // (total_blocks/total_bytes and PpInfo are updated during flush)
                     let h = g.heap.as_mut().unwrap();
                     h.curr_blocks += 1;
                     h.curr_bytes += size;
 
-                    // Check for peak
                     if h.curr_bytes >= h.max_bytes {
                         h.max_bytes = h.curr_bytes;
                         h.max_blocks = h.curr_blocks;
@@ -1499,21 +1696,45 @@ unsafe impl GlobalAlloc for Alloc {
             } else {
                 None
             }
-        }; // Lock released here
+        };
 
         // Add to thread buffer if we're using buffering
         if let Some((bt, buffer_capacity)) = buffered_alloc {
-            let should_flush = THREAD_BUFFER.with(|tb| {
+            let (should_flush, needs_registration) = THREAD_BUFFER.with(|tb| {
                 let mut tb_ref = tb.borrow_mut();
                 let buffer = tb_ref.get_or_insert_with(|| ThreadBuffer::new(buffer_capacity));
+                let needs_reg = !buffer.registered;
+                if needs_reg {
+                    buffer.registered = true;
+                }
                 buffer.pending.push(PendingAlloc {
                     ptr: ptr as usize,
                     backtrace: bt,
                     size,
                     instant: now,
                 });
-                buffer.is_full()
+                (buffer.is_full(), needs_reg)
             });
+
+            // Register the buffer with global state if this is its first use.
+            // This must be done after releasing the RefCell borrow above, then
+            // re-acquiring it along with the TRI_GLOBALS lock.
+            if needs_registration {
+                THREAD_BUFFER.with(|tb| {
+                    let tb_ref = tb.borrow();
+                    if let Some(buffer) = tb_ref.as_ref() {
+                        // SAFETY: The pointer is to thread-local storage which
+                        // remains valid until the thread exits. We unregister
+                        // the pointer in ThreadBuffer's Drop before the storage
+                        // is invalidated.
+                        let buffer_ptr = buffer as *const ThreadBuffer as *mut ThreadBuffer;
+                        let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
+                        if let Phase::Running(Globals { heap: Some(h), .. }) = phase {
+                            h.register_thread_buffer(buffer_ptr);
+                        }
+                    }
+                });
+            }
 
             if should_flush {
                 flush_thread_buffer();
@@ -1596,7 +1817,7 @@ unsafe impl GlobalAlloc for Alloc {
             System.dealloc(ptr, layout);
 
             if let Phase::Running(g @ Globals { heap: Some(_), .. }) = phase {
-                let size = layout.size();
+
 
                 // Remove the record of the live block and get the
                 // `PpInfo`. If it's not in the live block table, it must
@@ -1656,11 +1877,17 @@ pub fn ad_hoc_event(weight: usize) {
 
 impl Profiler {
     fn drop_inner(&mut self, memory_output: Option<&mut String>) {
-        // Flush any pending allocations from this thread's buffer first.
-        flush_thread_buffer();
+        // Flush all pending allocations from all threads' buffers.
+        // This includes threads that haven't exited yet (like thread pools).
+        flush_all_thread_buffers();
 
         let ignore_allocs = IgnoreAllocs::new();
         std::assert!(!ignore_allocs.was_already_ignoring_allocs);
+
+        // Increment generation to invalidate thread-local caches before
+        // deallocating Globals. This prevents use-after-free if allocations
+        // happen after profiler drop.
+        PROFILER_GENERATION.fetch_add(1, Ordering::Relaxed);
 
         let phase: &mut Phase<Globals> = &mut TRI_GLOBALS.lock();
         match std::mem::replace(phase, Phase::Ready) {
@@ -2033,6 +2260,9 @@ where
     }
 
     // Failure.
+    // Increment generation before finish() consumes Globals, to invalidate
+    // any cached pointers to its data.
+    PROFILER_GENERATION.fetch_add(1, Ordering::Relaxed);
     match std::mem::replace(phase, Phase::PostAssert) {
         Phase::Ready => unreachable!(),
         Phase::Running(g) => {
